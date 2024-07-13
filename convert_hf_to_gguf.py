@@ -1791,6 +1791,77 @@ class Qwen2MoeModel(Model):
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
 
+@Model.register("TinyllmForCausalLM")
+class TinyllmModel(Model):
+    model_arch = gguf.MODEL_ARCH.TINYLLM
+
+    def set_vocab(self):
+        dir_model = self.dir_model
+        hparams = self.hparams
+        tokens: list[bytes] = []
+        toktypes: list[int] = []
+        scores: list[float] = []
+
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(dir_model, trust_remote_code=True)
+        vocab_size = hparams.get("vocab_size", len(tokenizer.get_vocab()))
+        assert max(tokenizer.get_vocab().values()) < vocab_size
+        role_special_tokens = ["<|system|>", "<|user|>", "<|assistant|>", "<|observation|>"]
+        special_tokens = ["[MASK]", "[gMASK]", "[sMASK]", "sop", "eop"] + role_special_tokens
+        for token_id in range(vocab_size):
+            piece = tokenizer._convert_id_to_token(token_id)
+            if token_id == 0:
+                piece = "<unk>"
+            elif token_id == 1:
+                piece = "<bos>"
+            elif token_id == 2:
+                piece = "<eos>"
+
+            text = piece.encode("utf-8")
+            score = 0.0
+            # Referencing the tokenizer Python implementation(https://huggingface.co/THUDM/chatglm3-6b/blob/main/tokenization_chatglm.py),
+            # it is only valid if it is less than tokenizer.tokenizer.sp_model.vocab_size()
+            if len(piece) != 0 and token_id < tokenizer.tokenizer.sp_model.vocab_size():
+                score = tokenizer.tokenizer.sp_model.get_score(token_id)
+
+            if len(piece) == 0:
+                text = f"[PAD{token_id}]".encode("utf-8")
+
+            if token_id >= tokenizer.tokenizer.sp_model.vocab_size():
+                if piece in special_tokens:
+                    # show special tokens in prompt
+                    toktype = SentencePieceTokenTypes.USER_DEFINED
+                else:
+                    toktype = SentencePieceTokenTypes.UNKNOWN
+                tokens.append(text)
+                scores.append(score)
+                toktypes.append(toktype)
+                continue
+
+            toktype = SentencePieceTokenTypes.NORMAL
+            if tokenizer.tokenizer.sp_model.is_unknown(token_id):
+                toktype = SentencePieceTokenTypes.UNKNOWN
+            elif tokenizer.tokenizer.sp_model.is_control(token_id):
+                toktype = SentencePieceTokenTypes.CONTROL
+            elif tokenizer.tokenizer.sp_model.is_unused(token_id):
+                toktype = SentencePieceTokenTypes.UNUSED
+            elif tokenizer.tokenizer.sp_model.is_byte(token_id):
+                toktype = SentencePieceTokenTypes.BYTE
+
+            tokens.append(text)
+            scores.append(score)
+            toktypes.append(toktype)
+
+        self.gguf_writer.add_tokenizer_model("llama")
+        # glm3 needs prefix and suffix formatted as:
+        # prompt = "[gMASK]sop<|user|>\n" + prompt + "<|assistant|>"
+        self.gguf_writer.add_tokenizer_pre("chatglm-spm")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
 
 @Model.register("GPT2LMHeadModel")
 class GPT2Model(Model):
